@@ -165,8 +165,69 @@ export class DistributorView {
 
     let touchActive = false;
 
+    let dragMoved = false;
+
     const onDown = (x: number, y: number) => {
-      // Close
+      dragMoved = false;
+
+      // Potion slots — start drag (priority on down)
+      for (const slot of this.potionSlots) {
+        if (x >= slot.x && x <= slot.x + slot.w && y >= slot.y && y <= slot.y + slot.h) {
+          this.dragging = { idx: slot.idx, potion: slot.potion, x, y };
+          return;
+        }
+      }
+    };
+
+    const onMove = (x: number, y: number) => {
+      if (this.dragging) {
+        this.dragging.x = x;
+        this.dragging.y = y;
+        dragMoved = true;
+      }
+    };
+
+    const onUp = (x: number, y: number) => {
+      // If we were dragging, try to drop on NPC
+      if (this.dragging) {
+        const drag = this.dragging;
+        this.dragging = null;
+
+        if (dragMoved) {
+          for (const npc of this.npcs) {
+            const dist = Math.hypot(x - npc.x, y - npc.y);
+            if (dist < 55) {
+              const d = this.engine.distributors[npc.id];
+              if (!d.unlocked) continue;
+              if (d.stock.length >= this.engine.getDistributorCapacity(d)) {
+                this.setSpeech(npc, 'Full!');
+                return;
+              }
+              if (this.engine.assignToDistributor(npc.id, drag.idx)) {
+                playPlop();
+                const catColors: Record<string, string> = { potion: '#a855f7', candy: '#fb923c', prank: '#f87171', enchant: '#60a5fa' };
+                this.flyingPotions.push({
+                  x: x, y: y,
+                  targetX: npc.x, targetY: npc.y,
+                  color: catColors[drag.potion.category] || '#a855f7',
+                  name: drag.potion.name,
+                  landed: false,
+                  size: 12,
+                });
+                this.setSpeech(npc, 'Thanks!');
+                this.rebuildPotionSlots();
+              }
+              return;
+            }
+          }
+        }
+        // Drag cancelled (not over NPC or didn't move)
+        return;
+      }
+
+      // Not dragging — this is a tap. Handle tap actions:
+
+      // Close button
       if (Math.hypot(x - this.closeBtnX, y - this.closeBtnY) < this.closeBtnR + 8) {
         this.stop();
         this.onClose?.();
@@ -177,17 +238,16 @@ export class DistributorView {
       if (this.collectBtnNpc) {
         const dist = this.engine.distributors[this.collectBtnNpc];
         if (dist && dist.goldEarned > 0) {
-          const btnW = 120;
-          const btnH = 34;
           const npc = this.npcs.find(n => n.id === this.collectBtnNpc);
           if (npc) {
+            const btnW = 120;
+            const btnH = 34;
             const btnX = npc.x - btnW / 2;
-            const btnY = npc.y + 55;
+            const btnY = npc.y + 65;
             if (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH) {
               const amount = this.engine.collectDistributorGold(this.collectBtnNpc);
               if (amount > 0) {
                 playCoin();
-                // Spawn flying coins
                 for (let i = 0; i < Math.min(amount / 5, 15); i++) {
                   this.flyingCoins.push({
                     x: npc.x, y: npc.y,
@@ -207,11 +267,10 @@ export class DistributorView {
 
       // Tap NPC to select/deselect
       for (const npc of this.npcs) {
-        const dist = Math.hypot(x - npc.x, y - npc.y);
-        if (dist < 40) {
+        const d2 = Math.hypot(x - npc.x, y - npc.y);
+        if (d2 < 40) {
           const d = this.engine.distributors[npc.id];
           if (!d.unlocked) {
-            // Unlock
             if (this.engine.unlockDistributor(npc.id)) {
               playSuccessChime();
               this.setSpeech(npc, 'Ready!');
@@ -224,67 +283,29 @@ export class DistributorView {
         }
       }
 
-      // Potion slots — start drag
-      for (const slot of this.potionSlots) {
-        if (x >= slot.x && x <= slot.x + slot.w && y >= slot.y && y <= slot.y + slot.h) {
-          this.dragging = { idx: slot.idx, potion: slot.potion, x, y };
-          return;
-        }
-      }
-
-      // Tap empty area — deselect
+      // Tap empty — deselect
       this.selectedNpc = null;
       this.collectBtnNpc = null;
     };
 
-    const onMove = (x: number, y: number) => {
-      if (this.dragging) {
-        this.dragging.x = x;
-        this.dragging.y = y;
-      }
-    };
+    // Desktop: mousedown starts drag, mousemove updates, mouseup drops
+    this.canvas.addEventListener('mousedown', (e) => {
+      if (touchActive) return;
+      const p = getPos(e);
+      onDown(p.x, p.y);
+    });
+    this.canvas.addEventListener('mousemove', (e) => {
+      if (touchActive) return;
+      const p = getPos(e);
+      onMove(p.x, p.y);
+    });
+    this.canvas.addEventListener('mouseup', (e) => {
+      if (touchActive) return;
+      const p = getPos(e);
+      onUp(p.x, p.y);
+    });
 
-    const onUp = (x: number, y: number) => {
-      if (!this.dragging) return;
-      const drag = this.dragging;
-      this.dragging = null;
-
-      // Check if dropped on an NPC
-      for (const npc of this.npcs) {
-        const dist = Math.hypot(x - npc.x, y - npc.y);
-        if (dist < 50) {
-          const d = this.engine.distributors[npc.id];
-          if (!d.unlocked) continue;
-          if (d.stock.length >= this.engine.getDistributorCapacity(d)) {
-            this.setSpeech(npc, 'Full!');
-            return;
-          }
-          // Assign potion
-          if (this.engine.assignToDistributor(npc.id, drag.idx)) {
-            playPlop();
-            // Flying potion animation
-            const catColors: Record<string, string> = { potion: '#a855f7', candy: '#fb923c', prank: '#f87171', enchant: '#60a5fa' };
-            this.flyingPotions.push({
-              x: drag.x, y: drag.y,
-              targetX: npc.x, targetY: npc.y,
-              color: catColors[drag.potion.category] || '#a855f7',
-              name: drag.potion.name,
-              landed: false,
-              size: 12,
-            });
-            this.setSpeech(npc, 'Thanks!');
-            this.rebuildPotionSlots();
-          }
-          return;
-        }
-      }
-    };
-
-    this.canvas.addEventListener('click', (e) => { if (touchActive) return; const p = getPos(e); onDown(p.x, p.y); });
-    this.canvas.addEventListener('mousedown', (e) => { if (touchActive) return; });
-    this.canvas.addEventListener('mousemove', (e) => { if (touchActive) return; const p = getPos(e); onMove(p.x, p.y); });
-    this.canvas.addEventListener('mouseup', (e) => { if (touchActive) return; const p = getPos(e); onUp(p.x, p.y); });
-
+    // Mobile: touchstart starts drag, touchmove updates, touchend drops
     this.canvas.addEventListener('touchstart', (e) => {
       e.preventDefault();
       touchActive = true;
