@@ -2,6 +2,7 @@ import { GameEngine, type GameEvent } from '../engine/GameEngine';
 import { BaseRenderer } from '../canvas/BaseRenderer';
 import { BrewingView } from '../canvas/BrewingView';
 import { ForagingView } from '../canvas/ForagingView';
+import { DistributorView } from '../canvas/DistributorView';
 import { renderMapView } from './screens/MapView';
 import { renderBaseView } from './screens/BaseView';
 import { renderBrewing } from './screens/Brewing';
@@ -42,6 +43,8 @@ export class App {
   private brewCanvas: HTMLCanvasElement | null = null;
   private foragingView: ForagingView | null = null;
   private forageCanvas: HTMLCanvasElement | null = null;
+  private distributorView: DistributorView | null = null;
+  private distributorCanvas: HTMLCanvasElement | null = null;
   private currentScreen: Screen = 'home';
   private manaTimerInterval: number | null = null;
 
@@ -151,10 +154,13 @@ export class App {
         // Always close canvas views first
         if (this.brewingView) this.closeBrewingCanvas();
         if (this.foragingView) this.closeForagingCanvas();
+        if (this.distributorView) this.closeDistributorCanvas();
         if (screen === 'brew') {
           this.openBrewingCanvas();
         } else if (screen === 'forage') {
           this.openForagingCanvas();
+        } else if (screen === 'distributors') {
+          this.openDistributorCanvas();
         } else if (this.currentScreen === screen) {
           this.closePanel();
         } else {
@@ -177,7 +183,7 @@ export class App {
         case 'window':
         case 'window2': this.openPanel('map'); break;
         case 'workbench': this.openPanel('dashboard'); break;
-        case 'door': this.openPanel('distributors'); break;
+        case 'door': this.openDistributorCanvas(); break;
         case 'ingredients': this.openForagingCanvas(); break;
       }
     };
@@ -323,6 +329,40 @@ export class App {
     this.currentScreen = 'home';
     this.updateBottomBar();
     this.renderer.ingredientCount = Object.values(this.engine.ingredients).reduce((a, b) => a + b, 0);
+  }
+
+  private openDistributorCanvas(): void {
+    this.closePanel();
+    if (this.brewingView) this.closeBrewingCanvas();
+    if (this.foragingView) this.closeForagingCanvas();
+
+    const baseW = this.canvas.getBoundingClientRect().width;
+    const baseH = this.canvas.getBoundingClientRect().height;
+    this.distributorCanvas = document.createElement('canvas');
+    this.distributorCanvas.style.cssText = `position:absolute;left:0;top:0;width:${baseW}px;height:${baseH}px;z-index:25;touch-action:none;`;
+    this.canvasContainer.appendChild(this.distributorCanvas);
+
+    setTimeout(() => {
+      this.distributorView = new DistributorView(this.distributorCanvas!, this.engine);
+      this.distributorView.onClose = () => this.closeDistributorCanvas();
+    }, 50);
+
+    this.currentScreen = 'distributors';
+    this.updateBottomBar();
+  }
+
+  private closeDistributorCanvas(): void {
+    if (this.distributorView) {
+      this.distributorView.stop();
+      this.distributorView = null;
+    }
+    if (this.distributorCanvas) {
+      this.distributorCanvas.remove();
+      this.distributorCanvas = null;
+    }
+    this.currentScreen = 'home';
+    this.updateBottomBar();
+    this.renderer.potionCount = this.engine.inventory.length;
   }
 
   private closeBrewingCanvas(): void {
