@@ -1,6 +1,7 @@
 import { GameEngine, type GameEvent } from '../engine/GameEngine';
 import { BaseRenderer } from '../canvas/BaseRenderer';
 import { BrewingView } from '../canvas/BrewingView';
+import { ForagingView } from '../canvas/ForagingView';
 import { renderMapView } from './screens/MapView';
 import { renderBaseView } from './screens/BaseView';
 import { renderBrewing } from './screens/Brewing';
@@ -13,6 +14,8 @@ import { showToast } from './Toast';
 import { formatGold } from './helpers';
 import { icon } from './icons';
 import { startBubbling, stopBubbling, playPlop, playSizzle, playSuccessChime, playMasterworkFanfare, playPour, playRustle, playCoin } from '../audio/SoundEngine';
+import { UPGRADES } from '../data/upgrades';
+import { getNextBaseTier } from '../data/base';
 
 type Screen = 'home' | 'map' | 'base' | 'brew' | 'forage' | 'distributors' | 'inventory' | 'upgrades' | 'dashboard';
 
@@ -37,6 +40,8 @@ export class App {
   private renderer!: BaseRenderer;
   private brewingView: BrewingView | null = null;
   private brewCanvas: HTMLCanvasElement | null = null;
+  private foragingView: ForagingView | null = null;
+  private forageCanvas: HTMLCanvasElement | null = null;
   private currentScreen: Screen = 'home';
   private manaTimerInterval: number | null = null;
 
@@ -143,10 +148,13 @@ export class App {
     this.bottomBarEl.querySelectorAll('[data-nav]').forEach(el => {
       el.addEventListener('click', () => {
         const screen = el.getAttribute('data-nav') as Screen;
-        // Always close brewing canvas first
+        // Always close canvas views first
         if (this.brewingView) this.closeBrewingCanvas();
+        if (this.foragingView) this.closeForagingCanvas();
         if (screen === 'brew') {
           this.openBrewingCanvas();
+        } else if (screen === 'forage') {
+          this.openForagingCanvas();
         } else if (this.currentScreen === screen) {
           this.closePanel();
         } else {
@@ -168,11 +176,99 @@ export class App {
         case 'shelves': this.openPanel('inventory'); break;
         case 'window':
         case 'window2': this.openPanel('map'); break;
-        case 'workbench': this.openPanel('upgrades'); break;
+        case 'workbench': this.openPanel('dashboard'); break;
         case 'door': this.openPanel('distributors'); break;
-        case 'ingredients': this.openPanel('forage'); break;
+        case 'ingredients': this.openForagingCanvas(); break;
       }
     };
+
+    this.renderer.onUpgradeClick = (id) => {
+      this.handleUpgrade(id);
+    };
+
+    this.refreshUpgradeInfo();
+  }
+
+  // Map hotspots to their relevant upgrades
+  private getHotspotUpgrade(hotspotId: string): { upgradeId: string; label: string; cost: number } | null {
+    const mapping: Record<string, string[]> = {
+      cauldron: ['copper_cauldron', 'iron_cauldron', 'enchanted_cauldron'],
+      shelves: ['extra_shelves', 'big_shelves'],
+      workbench: ['recipe_book', 'master_recipes'],
+      ingredients: ['herbalist_bag', 'deep_pockets'],
+      door: ['bigger_carts', 'enchanted_carts'],
+      window: [], // Base upgrade handled separately
+    };
+
+    const ids = mapping[hotspotId];
+    if (!ids) return null;
+
+    // Find the next unpurchased upgrade in the chain
+    for (const uid of ids) {
+      if (!this.engine.upgrades.has(uid)) {
+        const u = UPGRADES[uid];
+        if (!u) continue;
+        if (u.requires && !this.engine.upgrades.has(u.requires)) continue; // prereq not met
+        return { upgradeId: uid, label: u.name, cost: u.cost };
+      }
+    }
+
+    // Special: window → base upgrade
+    if (hotspotId === 'window') {
+      const next = getNextBaseTier(this.engine.baseTier);
+      if (next) return { upgradeId: '__base__', label: next.name, cost: next.cost };
+    }
+
+    return null;
+  }
+
+  private refreshUpgradeInfo(): void {
+    const info: Record<string, { label: string; cost: string; canAfford: boolean }> = {};
+    for (const hsId of ['cauldron', 'shelves', 'workbench', 'ingredients', 'door', 'window']) {
+      const upg = this.getHotspotUpgrade(hsId);
+      if (upg) {
+        info[hsId] = {
+          label: `Upgrade: ${upg.label}`,
+          cost: `${formatGold(upg.cost)}g`,
+          canAfford: this.engine.gold >= upg.cost,
+        };
+      }
+    }
+    // Also window2 = same as window
+    if (info['window']) info['window2'] = info['window'];
+    this.renderer.setUpgradeInfo(info);
+  }
+
+  private handleUpgrade(hotspotId: string): void {
+    const upg = this.getHotspotUpgrade(hotspotId);
+    if (!upg) {
+      showToast('Fully upgraded!', 'info');
+      return;
+    }
+
+    if (upg.upgradeId === '__base__') {
+      if (this.engine.upgradeBase()) {
+        this.renderer.setTier(this.engine.baseTier);
+        playSuccessChime();
+        showToast(`Upgraded to ${this.engine.getCurrentBase().name}!`, 'success');
+        this.refreshUpgradeInfo();
+        this.updateTopBar();
+      } else {
+        const check = this.engine.canUpgradeBase();
+        showToast(check.reason || 'Cannot upgrade', 'error');
+      }
+      return;
+    }
+
+    if (this.engine.buyUpgrade(upg.upgradeId)) {
+      playCoin();
+      showToast(`Purchased ${UPGRADES[upg.upgradeId]?.name}!`, 'success');
+      this.refreshUpgradeInfo();
+      this.updateTopBar();
+    } else {
+      const check = this.engine.canBuyUpgrade(upg.upgradeId);
+      showToast(check.reason || 'Cannot purchase', 'error');
+    }
   }
 
   private openBrewingCanvas(): void {
@@ -194,6 +290,39 @@ export class App {
 
     this.currentScreen = 'brew';
     this.updateBottomBar();
+  }
+
+  private openForagingCanvas(): void {
+    this.closePanel();
+    if (this.brewingView) this.closeBrewingCanvas();
+
+    const baseW = this.canvas.getBoundingClientRect().width;
+    const baseH = this.canvas.getBoundingClientRect().height;
+    this.forageCanvas = document.createElement('canvas');
+    this.forageCanvas.style.cssText = `position:absolute;left:0;top:0;width:${baseW}px;height:${baseH}px;z-index:25;touch-action:none;`;
+    this.canvasContainer.appendChild(this.forageCanvas);
+
+    setTimeout(() => {
+      this.foragingView = new ForagingView(this.forageCanvas!, this.engine);
+      this.foragingView.onClose = () => this.closeForagingCanvas();
+    }, 50);
+
+    this.currentScreen = 'forage';
+    this.updateBottomBar();
+  }
+
+  private closeForagingCanvas(): void {
+    if (this.foragingView) {
+      this.foragingView.stop();
+      this.foragingView = null;
+    }
+    if (this.forageCanvas) {
+      this.forageCanvas.remove();
+      this.forageCanvas = null;
+    }
+    this.currentScreen = 'home';
+    this.updateBottomBar();
+    this.renderer.ingredientCount = Object.values(this.engine.ingredients).reduce((a, b) => a + b, 0);
   }
 
   private closeBrewingCanvas(): void {
@@ -336,6 +465,7 @@ export class App {
         case 'xp_changed':
           this.updateTopBar();
           this.updateBottomBar();
+          this.refreshUpgradeInfo();
           break;
 
         case 'inventory_changed':

@@ -84,6 +84,7 @@ export class BaseRenderer {
   private lastInteractionTime = 0;
   onHotspotClick: ((id: string) => void) | null = null;
   onHotspotHover: ((id: string | null) => void) | null = null;
+  onUpgradeClick: ((hotspotId: string) => void) | null = null;
 
   // Shelves visual state
   potionCount = 0;
@@ -92,6 +93,17 @@ export class BaseRenderer {
 
   // Brewing animation state
   private brewAnim: BrewAnimation | null = null;
+
+  // Context menu
+  private contextMenu: {
+    hotspotId: string;
+    x: number; y: number;
+    openTime: number;
+    useLabel: string;
+    upgradeLabel: string;
+    upgradeCost: string;
+    canUpgrade: boolean;
+  } | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -141,49 +153,104 @@ export class BaseRenderer {
       this.updateHover();
     });
 
-    // Track whether touch handled the tap so click doesn't double-fire
-    let touchHandled = false;
+    let touchActive = false;
+
+    const handleTap = (x: number, y: number) => {
+      this.mouseX = x;
+      this.mouseY = y;
+      this.lastInteractionTime = this.time;
+
+      // Check if tapping a context menu button
+      if (this.contextMenu) {
+        const cm = this.contextMenu;
+        const btnW = 130;
+        const btnH = 36;
+        const btnX = cm.x - btnW / 2;
+
+        // "Use" button
+        const useY = cm.y - 8 - btnH;
+        if (x >= btnX && x <= btnX + btnW && y >= useY && y <= useY + btnH) {
+          const id = cm.hotspotId;
+          this.contextMenu = null;
+          this.onHotspotClick?.(id);
+          return;
+        }
+
+        // "Upgrade" button
+        const upgY = cm.y + 8;
+        if (x >= btnX && x <= btnX + btnW && y >= upgY && y <= upgY + btnH && cm.canUpgrade) {
+          const id = cm.hotspotId;
+          this.contextMenu = null;
+          this.onUpgradeClick?.(id);
+          return;
+        }
+
+        // Tapped outside menu — close it
+        this.contextMenu = null;
+        return;
+      }
+
+      // Check hotspots
+      this.updateHover();
+      if (this.hoveredHotspot) {
+        this.showContextMenu(this.hoveredHotspot, x, y);
+      }
+    };
 
     this.canvas.addEventListener('click', (e) => {
-      if (touchHandled) {
-        touchHandled = false;
-        return; // Already handled by touchend
-      }
+      if (touchActive) return;
       const p = getPos(e);
-      this.mouseX = p.x;
-      this.mouseY = p.y;
-      this.lastInteractionTime = this.time;
-      this.updateHover();
-      if (this.hoveredHotspot && this.onHotspotClick) {
-        this.onHotspotClick(this.hoveredHotspot);
+      handleTap(p.x, p.y);
+    });
+
+    this.canvas.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      touchActive = true;
+      if (e.touches.length > 0) {
+        const p = getPos(e.touches[0]);
+        handleTap(p.x, p.y);
       }
     });
 
-    // Touch: record start, fire on touchend if didn't drag
-    this.canvas.addEventListener('touchstart', (e) => {
-      if (e.touches.length > 0) {
-        this.touchStartPos = getPos(e.touches[0]);
-        this.lastInteractionTime = this.time;
-      }
-    }, { passive: true });
-
     this.canvas.addEventListener('touchend', (e) => {
-      if (!this.touchStartPos || e.changedTouches.length === 0) return;
-      const p = getPos(e.changedTouches[0]);
-      const dx = Math.abs(p.x - this.touchStartPos.x);
-      const dy = Math.abs(p.y - this.touchStartPos.y);
-      this.touchStartPos = null;
-      if (dx > 20 || dy > 20) return; // Was a drag, ignore
+      e.preventDefault();
+      setTimeout(() => { touchActive = false; }, 300);
+    });
+  }
 
-      this.mouseX = p.x;
-      this.mouseY = p.y;
-      this.lastInteractionTime = this.time;
-      this.updateHover();
-      if (this.hoveredHotspot && this.onHotspotClick) {
-        touchHandled = true; // Suppress the upcoming synthetic click
-        this.onHotspotClick(this.hoveredHotspot);
-      }
-    }, { passive: true });
+  // Upgrade info per hotspot — set by App
+  private upgradeInfo: Record<string, { label: string; cost: string; canAfford: boolean }> = {};
+
+  setUpgradeInfo(info: Record<string, { label: string; cost: string; canAfford: boolean }>): void {
+    this.upgradeInfo = info;
+  }
+
+  private showContextMenu(hotspotId: string, x: number, y: number): void {
+    const hs = this.hotspots.find(h => h.id === hotspotId);
+    if (!hs) return;
+
+    const useLabels: Record<string, string> = {
+      cauldron: 'Brew Potions',
+      shelves: 'View Inventory',
+      window: 'World Map',
+      window2: 'World Map',
+      workbench: 'View Stats',
+      door: 'Distributors',
+      ingredients: 'Go Foraging',
+    };
+
+    const upgrade = this.upgradeInfo[hotspotId];
+
+    this.contextMenu = {
+      hotspotId,
+      x: hs.x + hs.w / 2,
+      y: hs.y + hs.h / 2,
+      openTime: this.time,
+      useLabel: useLabels[hotspotId] || 'Use',
+      upgradeLabel: upgrade?.label || '',
+      upgradeCost: upgrade?.cost || '',
+      canUpgrade: upgrade?.canAfford ?? false,
+    };
   }
 
   private updateHover(): void {
@@ -693,7 +760,7 @@ export class BaseRenderer {
     this.drawHotspots(ctx);
 
     // Draw tooltip
-    this.drawTooltip(ctx);
+    this.drawContextMenu(ctx);
   }
 
   // ── Room Drawings ─────────────────────────────────────
@@ -1414,36 +1481,87 @@ export class BaseRenderer {
     }
   }
 
-  private drawTooltip(ctx: CanvasRenderingContext2D): void {
-    if (!this.hoveredHotspot) return;
-    const hs = this.hotspots.find(h => h.id === this.hoveredHotspot);
-    if (!hs) return;
+  private drawContextMenu(ctx: CanvasRenderingContext2D): void {
+    const cm = this.contextMenu;
+    if (!cm) return;
 
-    const text = hs.label;
-    ctx.font = '600 13px Inter, sans-serif';
-    const metrics = ctx.measureText(text);
-    const tw = metrics.width + 16;
-    const th = 28;
-    let tx = hs.x + hs.w / 2 - tw / 2;
-    let ty = hs.y - th - 6;
-    if (ty < 4) ty = hs.y + hs.h + 6;
-    if (tx < 4) tx = 4;
-    if (tx + tw > this.width - 4) tx = this.width - tw - 4;
+    const elapsed = this.time - cm.openTime;
+    const scale = Math.min(1, elapsed / 0.15); // Quick pop-in
+    const alpha = Math.min(1, elapsed / 0.1);
 
-    ctx.fillStyle = 'rgba(22, 18, 41, 0.92)';
-    this.roundRect(ctx, tx, ty, tw, th, 6);
+    ctx.globalAlpha = alpha;
+    ctx.save();
+    ctx.translate(cm.x, cm.y);
+    ctx.scale(scale, scale);
+
+    const btnW = 140;
+    const btnH = 38;
+    const gap = 6;
+    const hasUpgrade = cm.upgradeLabel.length > 0;
+
+    // "Use" button (above center)
+    const useX = -btnW / 2;
+    const useY = -gap / 2 - btnH;
+
+    // Glow behind menu
+    const glowGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, btnW);
+    glowGrad.addColorStop(0, 'rgba(168, 85, 247, 0.12)');
+    glowGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = glowGrad;
+    ctx.beginPath();
+    ctx.arc(0, 0, btnW, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(168, 85, 247, 0.5)';
-    ctx.lineWidth = 1;
-    this.roundRect(ctx, tx, ty, tw, th, 6);
-    ctx.stroke();
 
-    ctx.fillStyle = '#e2ddf5';
+    // Use button
+    const useGrad = ctx.createLinearGradient(useX, useY, useX + btnW, useY + btnH);
+    useGrad.addColorStop(0, '#7c3aed');
+    useGrad.addColorStop(1, '#a855f7');
+    ctx.fillStyle = useGrad;
+    this.roundRect(ctx, useX, useY, btnW, btnH, 10);
+    ctx.fill();
+    // Button border glow
+    ctx.strokeStyle = 'rgba(168, 85, 247, 0.4)';
+    ctx.lineWidth = 1;
+    this.roundRect(ctx, useX, useY, btnW, btnH, 10);
+    ctx.stroke();
+    // Text
+    ctx.fillStyle = 'white';
+    ctx.font = '600 13px Inter, sans-serif';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(text, tx + tw / 2, ty + th / 2);
+    ctx.fillText(cm.useLabel, 0, useY + btnH / 2);
+
+    // Upgrade button (below center)
+    if (hasUpgrade) {
+      const upgY = gap / 2;
+      const upgAlpha = cm.canUpgrade ? 1 : 0.4;
+      ctx.globalAlpha = alpha * upgAlpha;
+
+      const upgGrad = ctx.createLinearGradient(useX, upgY, useX + btnW, upgY + btnH);
+      upgGrad.addColorStop(0, '#b8860b');
+      upgGrad.addColorStop(1, '#fbbf24');
+      ctx.fillStyle = upgGrad;
+      this.roundRect(ctx, useX, upgY, btnW, btnH, 10);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(251, 191, 36, 0.3)';
+      ctx.lineWidth = 1;
+      this.roundRect(ctx, useX, upgY, btnW, btnH, 10);
+      ctx.stroke();
+      // Text
+      ctx.fillStyle = '#1a0a00';
+      ctx.font = '600 11px Inter, sans-serif';
+      ctx.fillText(cm.upgradeLabel, 0, upgY + btnH / 2 - 5);
+      ctx.font = '500 10px Inter, sans-serif';
+      ctx.fillStyle = '#4a2800';
+      ctx.fillText(cm.upgradeCost, 0, upgY + btnH / 2 + 9);
+
+      ctx.globalAlpha = alpha;
+    }
+
     ctx.textAlign = 'start';
     ctx.textBaseline = 'alphabetic';
+    ctx.restore();
+    ctx.globalAlpha = 1;
   }
 
   // ── Helpers ───────────────────────────────────────────
