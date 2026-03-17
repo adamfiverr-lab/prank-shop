@@ -1,28 +1,13 @@
 import { GameEngine, type Potion, type DistributorState } from '../engine/GameEngine';
 import { DISTRIBUTORS } from '../data/distributors';
-import { playCoin, playPlop, playSuccessChime } from '../audio/SoundEngine';
-import { getRecipe } from '../data/recipes';
+import { playCoin, playPlop, playSuccessChime, playBubble } from '../audio/SoundEngine';
 
 // ── Types ───────────────────────────────────────────────
-
-interface NpcVisual {
-  id: string;
-  name: string;
-  x: number; y: number;
-  color: string;
-  bodyColor: string;
-  eyeColor: string;
-  bobPhase: number;
-  // Speech bubble
-  speech: string;
-  speechTime: number;
-}
 
 interface FlyingPotion {
   x: number; y: number;
   targetX: number; targetY: number;
   color: string;
-  name: string;
   landed: boolean;
   size: number;
 }
@@ -33,6 +18,33 @@ interface FlyingCoin {
   life: number;
   size: number;
 }
+
+interface AmbientParticle {
+  x: number; y: number;
+  vx: number; vy: number;
+  size: number; alpha: number;
+  color: string; life: number; maxLife: number;
+}
+
+type ViewMode = 'select' | 'npc';
+
+// ── Scene themes per NPC ────────────────────────────────
+
+interface NpcTheme {
+  bgTop: string; bgBot: string;
+  groundColor: string;
+  ambientColor: string;
+  particleColor: string;
+  glowColor: string;
+}
+
+const NPC_THEMES: Record<string, NpcTheme> = {
+  grix: { bgTop: '#0f1a08', bgBot: '#1a2810', groundColor: '#2a3a18', ambientColor: '#4ade80', particleColor: '#86efac', glowColor: '#22c55e' },
+  whisper: { bgTop: '#1a0828', bgBot: '#1f1030', groundColor: '#2a1a3a', ambientColor: '#f9a8d4', particleColor: '#fce7f3', glowColor: '#ec4899' },
+  skrag: { bgTop: '#1a0808', bgBot: '#200e0e', groundColor: '#2a1414', ambientColor: '#f87171', particleColor: '#fca5a5', glowColor: '#ef4444' },
+  barnaby: { bgTop: '#1a1408', bgBot: '#201a0e', groundColor: '#2a2214', ambientColor: '#fbbf24', particleColor: '#fde68a', glowColor: '#d97706' },
+  patches: { bgTop: '#081018', bgBot: '#0e1520', groundColor: '#14202a', ambientColor: '#60a5fa', particleColor: '#93c5fd', glowColor: '#3b82f6' },
+};
 
 // ── Distributor View ────────────────────────────────────
 
@@ -49,34 +61,33 @@ export class DistributorView {
   private engine: GameEngine;
   onClose: (() => void) | null = null;
 
-  // NPCs
-  private npcs: NpcVisual[] = [];
-  private selectedNpc: string | null = null;
+  // View state
+  private mode: ViewMode = 'select';
+  private activeNpcId: string | null = null;
+
+  // NPC scene
+  private npcX = 0;
+  private npcY = 0;
+  private particles: AmbientParticle[] = [];
+  private flyingPotions: FlyingPotion[] = [];
+  private flyingCoins: FlyingCoin[] = [];
+  private speechText = '';
+  private speechTime = 0;
 
   // Potion tray
   private potionSlots: { potion: Potion; idx: number; x: number; y: number; w: number; h: number }[] = [];
-  private trayScrollOffset = 0;
-
-  // Dragging
   private dragging: { idx: number; potion: Potion; x: number; y: number } | null = null;
-
-  // Animations
-  private flyingPotions: FlyingPotion[] = [];
-  private flyingCoins: FlyingCoin[] = [];
 
   // UI
   private closeBtnX = 0;
   private closeBtnY = 0;
   private closeBtnR = 18;
-  private collectBtnNpc: string | null = null;
 
   constructor(canvas: HTMLCanvasElement, engine: GameEngine) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d')!;
     this.engine = engine;
     this.resize();
-    this.buildNpcs();
-    this.rebuildPotionSlots();
     this.setupEvents();
     this.start();
   }
@@ -95,40 +106,45 @@ export class DistributorView {
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this.closeBtnX = this.width - 30;
     this.closeBtnY = 24;
+    this.npcX = this.width * 0.5;
+    this.npcY = this.height * 0.32;
   }
 
-  private buildNpcs(): void {
-    this.npcs = [];
-    const dists = Object.values(this.engine.distributors);
-    const w = this.width;
-    const count = dists.length;
-    const spacing = Math.min(w / (count + 1), 90);
-    const startX = (w - spacing * (count - 1)) / 2;
+  private enterNpcView(npcId: string): void {
+    this.mode = 'npc';
+    this.activeNpcId = npcId;
+    this.particles = [];
+    this.flyingPotions = [];
+    this.flyingCoins = [];
+    this.speechText = '';
+    this.rebuildPotionSlots();
 
-    const npcColors: Record<string, { body: string; eye: string }> = {
-      grix: { body: '#2d5a2d', eye: '#fbbf24' },
-      whisper: { body: '#fce7f3', eye: '#ec4899' },
-      skrag: { body: '#7f1d1d', eye: '#fbbf24' },
-      barnaby: { body: '#78350f', eye: '#1a1a2e' },
-      patches: { body: '#c2410c', eye: '#fef3c7' },
-    };
-
-    for (let i = 0; i < count; i++) {
-      const dist = dists[i];
-      const colors = npcColors[dist.id] || { body: '#4a3d6a', eye: '#fbbf24' };
-      this.npcs.push({
-        id: dist.id,
-        name: dist.def.name.split(' ')[0], // First name only
-        x: startX + i * spacing,
-        y: this.height * 0.35,
-        color: dist.def.color,
-        bodyColor: colors.body,
-        eyeColor: colors.eye,
-        bobPhase: i * 1.3,
-        speech: '',
-        speechTime: 0,
+    // Seed ambient particles
+    const theme = NPC_THEMES[npcId] || NPC_THEMES.grix;
+    for (let i = 0; i < 20; i++) {
+      this.particles.push({
+        x: Math.random() * this.width,
+        y: Math.random() * this.height * 0.7,
+        vx: (Math.random() - 0.5) * 0.3,
+        vy: -0.15 - Math.random() * 0.3,
+        size: 1 + Math.random() * 2,
+        alpha: 0.1 + Math.random() * 0.2,
+        color: theme.particleColor,
+        life: Math.random() * 200,
+        maxLife: 200 + Math.random() * 200,
       });
     }
+
+    // Greeting
+    const greetings: Record<string, string> = {
+      grix: "Oi! Whatcha got for me?",
+      whisper: "Hello, dear wizard~",
+      skrag: "Heh heh... show me the goods.",
+      barnaby: "Good day! Quality wares only.",
+      patches: "Mrrrow.",
+    };
+    this.speechText = greetings[npcId] || 'Hello!';
+    this.speechTime = this.time;
   }
 
   private rebuildPotionSlots(): void {
@@ -164,17 +180,18 @@ export class DistributorView {
     };
 
     let touchActive = false;
-
     let dragMoved = false;
 
     const onDown = (x: number, y: number) => {
       dragMoved = false;
 
-      // Potion slots — start drag (priority on down)
-      for (const slot of this.potionSlots) {
-        if (x >= slot.x && x <= slot.x + slot.w && y >= slot.y && y <= slot.y + slot.h) {
-          this.dragging = { idx: slot.idx, potion: slot.potion, x, y };
-          return;
+      if (this.mode === 'npc') {
+        // Start drag from potion tray
+        for (const slot of this.potionSlots) {
+          if (x >= slot.x && x <= slot.x + slot.w && y >= slot.y && y <= slot.y + slot.h) {
+            this.dragging = { idx: slot.idx, potion: slot.potion, x, y };
+            return;
+          }
         }
       }
     };
@@ -188,127 +205,49 @@ export class DistributorView {
     };
 
     const onUp = (x: number, y: number) => {
-      // If we were dragging, try to drop on NPC
-      if (this.dragging) {
+      // Handle drag drop
+      if (this.dragging && dragMoved) {
         const drag = this.dragging;
         this.dragging = null;
 
-        if (dragMoved) {
-          for (const npc of this.npcs) {
-            const dist = Math.hypot(x - npc.x, y - npc.y);
-            if (dist < 55) {
-              const d = this.engine.distributors[npc.id];
-              if (!d.unlocked) continue;
-              if (d.stock.length >= this.engine.getDistributorCapacity(d)) {
-                this.setSpeech(npc, 'Full!');
-                return;
-              }
-              if (this.engine.assignToDistributor(npc.id, drag.idx)) {
-                playPlop();
-                const catColors: Record<string, string> = { potion: '#a855f7', candy: '#fb923c', prank: '#f87171', enchant: '#60a5fa' };
-                this.flyingPotions.push({
-                  x: x, y: y,
-                  targetX: npc.x, targetY: npc.y,
-                  color: catColors[drag.potion.category] || '#a855f7',
-                  name: drag.potion.name,
-                  landed: false,
-                  size: 12,
-                });
-                this.setSpeech(npc, 'Thanks!');
-                this.rebuildPotionSlots();
-              }
-              return;
-            }
-          }
-        }
-        // Drag cancelled (not over NPC or didn't move)
-        return;
-      }
-
-      // Not dragging — this is a tap. Handle tap actions:
-
-      // Close button
-      if (Math.hypot(x - this.closeBtnX, y - this.closeBtnY) < this.closeBtnR + 8) {
-        this.stop();
-        this.onClose?.();
-        return;
-      }
-
-      // Collect gold button
-      if (this.collectBtnNpc) {
-        const dist = this.engine.distributors[this.collectBtnNpc];
-        if (dist && dist.goldEarned > 0) {
-          const npc = this.npcs.find(n => n.id === this.collectBtnNpc);
-          if (npc) {
-            const btnW = 120;
-            const btnH = 34;
-            const btnX = npc.x - btnW / 2;
-            const btnY = npc.y + 65;
-            if (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH) {
-              const amount = this.engine.collectDistributorGold(this.collectBtnNpc);
-              if (amount > 0) {
-                playCoin();
-                for (let i = 0; i < Math.min(amount / 5, 15); i++) {
-                  this.flyingCoins.push({
-                    x: npc.x, y: npc.y,
-                    vx: (Math.random() - 0.5) * 3,
-                    vy: -2 - Math.random() * 3,
-                    life: 40 + Math.random() * 30,
-                    size: 4 + Math.random() * 4,
-                  });
-                }
-                this.setSpeech(npc, `+${amount}g!`);
-              }
-              return;
-            }
-          }
-        }
-      }
-
-      // Tap NPC to select/deselect
-      for (const npc of this.npcs) {
-        const d2 = Math.hypot(x - npc.x, y - npc.y);
-        if (d2 < 40) {
-          const d = this.engine.distributors[npc.id];
-          if (!d.unlocked) {
-            if (this.engine.unlockDistributor(npc.id)) {
-              playSuccessChime();
-              this.setSpeech(npc, 'Ready!');
-            }
+        if (this.activeNpcId) {
+          // Check if dropped on NPC (upper area)
+          const dist = Math.hypot(x - this.npcX, y - this.npcY);
+          if (dist < 80) {
+            this.assignPotion(drag);
             return;
           }
-          this.selectedNpc = this.selectedNpc === npc.id ? null : npc.id;
-          this.collectBtnNpc = (d.goldEarned > 0 && this.selectedNpc === npc.id) ? npc.id : null;
-          return;
         }
+        return;
+      }
+      this.dragging = null;
+
+      // Tap actions
+      // Close button
+      if (Math.hypot(x - this.closeBtnX, y - this.closeBtnY) < this.closeBtnR + 10) {
+        if (this.mode === 'npc') {
+          this.mode = 'select';
+          this.activeNpcId = null;
+        } else {
+          this.stop();
+          this.onClose?.();
+        }
+        return;
       }
 
-      // Tap empty — deselect
-      this.selectedNpc = null;
-      this.collectBtnNpc = null;
+      if (this.mode === 'select') {
+        this.handleSelectTap(x, y);
+      } else if (this.mode === 'npc') {
+        this.handleNpcTap(x, y);
+      }
     };
 
-    // Desktop: mousedown starts drag, mousemove updates, mouseup drops
-    this.canvas.addEventListener('mousedown', (e) => {
-      if (touchActive) return;
-      const p = getPos(e);
-      onDown(p.x, p.y);
-    });
-    this.canvas.addEventListener('mousemove', (e) => {
-      if (touchActive) return;
-      const p = getPos(e);
-      onMove(p.x, p.y);
-    });
-    this.canvas.addEventListener('mouseup', (e) => {
-      if (touchActive) return;
-      const p = getPos(e);
-      onUp(p.x, p.y);
-    });
+    this.canvas.addEventListener('mousedown', (e) => { if (touchActive) return; const p = getPos(e); onDown(p.x, p.y); });
+    this.canvas.addEventListener('mousemove', (e) => { if (touchActive) return; const p = getPos(e); onMove(p.x, p.y); });
+    this.canvas.addEventListener('mouseup', (e) => { if (touchActive) return; const p = getPos(e); onUp(p.x, p.y); });
 
-    // Mobile: touchstart starts drag, touchmove updates, touchend drops
     this.canvas.addEventListener('touchstart', (e) => {
-      e.preventDefault();
-      touchActive = true;
+      e.preventDefault(); touchActive = true;
       if (e.touches.length > 0) { const p = getPos(e.touches[0]); onDown(p.x, p.y); }
     });
     this.canvas.addEventListener('touchmove', (e) => {
@@ -322,9 +261,110 @@ export class DistributorView {
     });
   }
 
-  private setSpeech(npc: NpcVisual, text: string): void {
-    npc.speech = text;
-    npc.speechTime = this.time;
+  private handleSelectTap(x: number, y: number): void {
+    // Location cards
+    const dists = Object.values(DISTRIBUTORS);
+    const cardW = this.width - 32;
+    const cardH = 64;
+    const gap = 10;
+    const startY = 60;
+
+    for (let i = 0; i < dists.length; i++) {
+      const cy = startY + i * (cardH + gap);
+      if (x >= 16 && x <= 16 + cardW && y >= cy && y <= cy + cardH) {
+        const d = this.engine.distributors[dists[i].id];
+        if (!d) return;
+        if (!d.unlocked) {
+          if (this.engine.unlockDistributor(dists[i].id)) {
+            playSuccessChime();
+          }
+          return;
+        }
+        this.enterNpcView(dists[i].id);
+        return;
+      }
+    }
+  }
+
+  private handleNpcTap(x: number, y: number): void {
+    if (!this.activeNpcId) return;
+    const dist = this.engine.distributors[this.activeNpcId];
+    if (!dist) return;
+
+    // Collect gold button
+    if (dist.goldEarned > 0) {
+      const btnW = 150;
+      const btnH = 40;
+      const btnX = this.npcX - btnW / 2;
+      const btnY = this.npcY + 90;
+      if (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH) {
+        const amount = this.engine.collectDistributorGold(this.activeNpcId);
+        if (amount > 0) {
+          playCoin();
+          for (let i = 0; i < Math.min(amount / 3, 20); i++) {
+            this.flyingCoins.push({
+              x: this.npcX, y: this.npcY,
+              vx: (Math.random() - 0.5) * 4,
+              vy: -2.5 - Math.random() * 3,
+              life: 50 + Math.random() * 40,
+              size: 5 + Math.random() * 5,
+            });
+          }
+          this.speechText = `Here's ${amount}g!`;
+          this.speechTime = this.time;
+        }
+        return;
+      }
+    }
+
+    // Tap NPC — random dialogue
+    const npcDist = Math.hypot(x - this.npcX, y - this.npcY);
+    if (npcDist < 60) {
+      const lines: Record<string, string[]> = {
+        grix: ["Business is business!", "Got anything spicy?", "Sell fast, ask later!", "The market's buzzing today."],
+        whisper: ["The students love your work~", "Such lovely potions!", "I'll find them good homes.", "Magic is beautiful, isn't it?"],
+        skrag: ["Nobody saw nothing.", "The good stuff sells itself.", "Keep it coming, wizard.", "Dark alleys, bright gold!"],
+        barnaby: ["Only the finest, please.", "My clients expect quality.", "A gentleman's trade.", "Splendid craftsmanship!"],
+        patches: ["Mrow?", "Purrr...", "*knocks potion off shelf*", "*stares judgmentally*", "Mrrrow!"],
+      };
+      const pool = lines[this.activeNpcId] || ["..."];
+      this.speechText = pool[Math.floor(Math.random() * pool.length)];
+      this.speechTime = this.time;
+      playBubble(1.0);
+    }
+  }
+
+  private assignPotion(drag: { idx: number; potion: Potion; x: number; y: number }): void {
+    if (!this.activeNpcId) return;
+    const d = this.engine.distributors[this.activeNpcId];
+    if (!d || !d.unlocked) return;
+    if (d.stock.length >= this.engine.getDistributorCapacity(d)) {
+      this.speechText = "I'm full! Come back later.";
+      this.speechTime = this.time;
+      return;
+    }
+    if (this.engine.assignToDistributor(this.activeNpcId, drag.idx)) {
+      playPlop();
+      const catColors: Record<string, string> = { potion: '#a855f7', candy: '#fb923c', prank: '#f87171', enchant: '#60a5fa' };
+      this.flyingPotions.push({
+        x: drag.x, y: drag.y,
+        targetX: this.npcX, targetY: this.npcY,
+        color: catColors[drag.potion.category] || '#a855f7',
+        landed: false,
+        size: 14,
+      });
+      const responses: Record<string, string[]> = {
+        grix: ["Nice!", "I'll move this quick!", "Cha-ching!"],
+        whisper: ["Lovely~", "The students will adore this!", "Thank you, dear!"],
+        skrag: ["Heh heh, perfect.", "Good stuff!", "Consider it sold."],
+        barnaby: ["Excellent choice.", "Fine quality!", "My clients will be pleased."],
+        patches: ["*purrs*", "Mrow!", "*nods approvingly*"],
+      };
+      const pool = responses[this.activeNpcId] || ["Thanks!"];
+      this.speechText = pool[Math.floor(Math.random() * pool.length)];
+      this.speechTime = this.time;
+      this.rebuildPotionSlots();
+    }
   }
 
   // ── Loop ──────────────────────────────────
@@ -347,24 +387,35 @@ export class DistributorView {
   }
 
   private update(): void {
+    if (this.mode !== 'npc') return;
+
+    // Ambient particles
+    const theme = NPC_THEMES[this.activeNpcId || 'grix'] || NPC_THEMES.grix;
+    for (const p of this.particles) {
+      p.x += p.vx + Math.sin(this.time * 0.5 + p.y * 0.01) * 0.1;
+      p.y += p.vy;
+      p.life++;
+      if (p.life > p.maxLife || p.y < -10) {
+        p.x = Math.random() * this.width;
+        p.y = this.height * 0.6 + Math.random() * this.height * 0.3;
+        p.life = 0;
+        p.color = theme.particleColor;
+      }
+    }
+
     // Flying potions
     for (const fp of this.flyingPotions) {
       if (fp.landed) continue;
       fp.x += (fp.targetX - fp.x) * 0.12;
       fp.y += (fp.targetY - fp.y) * 0.12;
       fp.size *= 0.97;
-      if (Math.abs(fp.x - fp.targetX) < 3 && Math.abs(fp.y - fp.targetY) < 3) {
-        fp.landed = true;
-      }
+      if (Math.abs(fp.x - fp.targetX) < 3) fp.landed = true;
     }
 
     // Flying coins
     for (let i = this.flyingCoins.length - 1; i >= 0; i--) {
       const c = this.flyingCoins[i];
-      c.x += c.vx;
-      c.y += c.vy;
-      c.vy += 0.1;
-      c.life--;
+      c.x += c.vx; c.y += c.vy; c.vy += 0.08; c.life--;
       if (c.life <= 0) this.flyingCoins.splice(i, 1);
     }
   }
@@ -372,67 +423,266 @@ export class DistributorView {
   // ── Draw ──────────────────────────────────
 
   private draw(): void {
+    if (this.mode === 'select') {
+      this.drawSelectScreen();
+    } else {
+      this.drawNpcScreen();
+    }
+  }
+
+  // ── Location Select Screen ────────────────
+
+  private drawSelectScreen(): void {
     const ctx = this.ctx;
     const w = this.width;
     const h = this.height;
     const t = this.time;
 
-    // Background — dark street scene
-    const bgGrad = ctx.createLinearGradient(0, 0, 0, h);
-    bgGrad.addColorStop(0, '#0a0818');
-    bgGrad.addColorStop(0.5, '#0f0d1f');
-    bgGrad.addColorStop(1, '#0a0812');
-    ctx.fillStyle = bgGrad;
+    // Dark background
+    ctx.fillStyle = '#080614';
     ctx.fillRect(0, 0, w, h);
 
-    // Cobblestone ground
-    const groundY = h * 0.55;
-    ctx.fillStyle = '#1a1520';
-    ctx.fillRect(0, groundY, w, h - groundY);
-    // Stone pattern
-    ctx.strokeStyle = '#0f0d18';
-    ctx.lineWidth = 0.5;
-    for (let row = 0; row < 8; row++) {
-      const ry = groundY + row * 16;
-      const offset = (row % 2) * 18;
-      for (let col = 0; col < w / 36 + 1; col++) {
-        ctx.strokeRect(offset + col * 36, ry, 34, 14);
-      }
-    }
+    // Title
+    ctx.fillStyle = '#e2ddf5';
+    ctx.font = '700 18px "Cinzel", serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Distributors', w / 2, 38);
+    ctx.textAlign = 'start';
 
-    // Lantern lights along the top
-    for (let i = 0; i < 3; i++) {
-      const lx = w * 0.2 + i * w * 0.3;
-      const ly = h * 0.08;
-      ctx.globalCompositeOperation = 'lighter';
-      const lGrad = ctx.createRadialGradient(lx, ly, 0, lx, ly, 80);
-      lGrad.addColorStop(0, 'rgba(251,191,36,0.12)');
-      lGrad.addColorStop(1, 'transparent');
-      ctx.fillStyle = lGrad;
-      ctx.beginPath();
-      ctx.arc(lx, ly, 80 + Math.sin(t * 4 + i) * 5, 0, Math.PI * 2);
+    // Location cards
+    const dists = Object.values(DISTRIBUTORS);
+    const cardW = w - 32;
+    const cardH = 64;
+    const gap = 10;
+    const startY = 60;
+
+    for (let i = 0; i < dists.length; i++) {
+      const def = dists[i];
+      const d = this.engine.distributors[def.id];
+      const theme = NPC_THEMES[def.id] || NPC_THEMES.grix;
+      const cy = startY + i * (cardH + gap);
+      const locked = !d.unlocked;
+
+      // Card bg with location color
+      const cardGrad = ctx.createLinearGradient(16, cy, 16 + cardW, cy);
+      cardGrad.addColorStop(0, locked ? '#1a1530' : theme.bgBot);
+      cardGrad.addColorStop(1, locked ? '#0d0a1a' : theme.bgTop);
+      ctx.fillStyle = cardGrad;
+      this.roundRect(ctx, 16, cy, cardW, cardH, 12);
       ctx.fill();
-      ctx.globalCompositeOperation = 'source-over';
-      // Lantern body
-      ctx.fillStyle = '#92400e';
-      ctx.fillRect(lx - 4, ly - 8, 8, 12);
-      ctx.fillStyle = '#fbbf24';
-      ctx.globalAlpha = 0.6 + Math.sin(t * 6 + i) * 0.2;
-      ctx.fillRect(lx - 3, ly - 6, 6, 8);
+
+      // Border
+      ctx.strokeStyle = locked ? '#2d2555' : theme.glowColor + '60';
+      ctx.lineWidth = 1;
+      this.roundRect(ctx, 16, cy, cardW, cardH, 12);
+      ctx.stroke();
+
+      // NPC avatar circle
+      ctx.globalAlpha = locked ? 0.3 : 1;
+      const avX = 52;
+      const avY = cy + cardH / 2;
+      ctx.fillStyle = locked ? '#2d2555' : def.color + '30';
+      ctx.beginPath();
+      ctx.arc(avX, avY, 22, 0, Math.PI * 2);
+      ctx.fill();
+      // Simple face
+      this.drawMiniNpc(ctx, avX, avY, def.id, 18, t + i);
+
+      // Name + location
+      ctx.fillStyle = locked ? '#5b4c8a' : '#e2ddf5';
+      ctx.font = '600 14px Inter, sans-serif';
+      ctx.fillText(def.name, 82, cy + 24);
+      ctx.fillStyle = locked ? '#3d3060' : '#8b83a8';
+      ctx.font = '500 11px Inter, sans-serif';
+      ctx.fillText(def.location, 82, cy + 40);
+
+      // Right side: stock or lock
+      if (locked) {
+        ctx.fillStyle = '#fbbf24';
+        ctx.font = '600 12px Inter, sans-serif';
+        ctx.textAlign = 'right';
+        ctx.fillText(`${def.unlockCost}g`, 16 + cardW - 16, cy + 28);
+        ctx.fillStyle = '#8b83a8';
+        ctx.font = '500 10px Inter, sans-serif';
+        ctx.fillText('Tap to unlock', 16 + cardW - 16, cy + 42);
+        ctx.textAlign = 'start';
+      } else {
+        const cap = this.engine.getDistributorCapacity(d);
+        // Stock dots
+        ctx.textAlign = 'right';
+        if (d.goldEarned > 0) {
+          ctx.fillStyle = '#fbbf24';
+          ctx.font = '700 13px Inter, sans-serif';
+          ctx.fillText(`${d.goldEarned}g`, 16 + cardW - 16, cy + 26);
+          ctx.fillStyle = '#4ade80';
+          ctx.font = '500 10px Inter, sans-serif';
+          ctx.fillText('Ready to collect!', 16 + cardW - 16, cy + 42);
+        } else {
+          ctx.fillStyle = '#8b83a8';
+          ctx.font = '500 11px Inter, sans-serif';
+          ctx.fillText(`${d.stock.length}/${cap} stock`, 16 + cardW - 16, cy + 26);
+          ctx.fillStyle = '#5b4c8a';
+          ctx.font = '500 10px Inter, sans-serif';
+          ctx.fillText(`${Math.round(def.cut * 100)}% cut · ${def.baseSellInterval}s/item`, 16 + cardW - 16, cy + 42);
+        }
+        ctx.textAlign = 'start';
+
+        // Glowing gold indicator
+        if (d.goldEarned > 0) {
+          ctx.globalCompositeOperation = 'lighter';
+          const gGrad = ctx.createRadialGradient(16 + cardW - 30, cy + cardH / 2, 0, 16 + cardW - 30, cy + cardH / 2, 30);
+          gGrad.addColorStop(0, 'rgba(251,191,36,0.15)');
+          gGrad.addColorStop(1, 'transparent');
+          ctx.fillStyle = gGrad;
+          ctx.beginPath();
+          ctx.arc(16 + cardW - 30, cy + cardH / 2, 30, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalCompositeOperation = 'source-over';
+        }
+      }
+
       ctx.globalAlpha = 1;
     }
 
-    // ── Draw NPCs ──
-    for (const npc of this.npcs) {
-      const d = this.engine.distributors[npc.id];
-      this.drawNpc(ctx, npc, d, t);
+    // Close button
+    this.drawCloseButton(ctx);
+  }
+
+  // ── NPC Interaction Screen ────────────────
+
+  private drawNpcScreen(): void {
+    const ctx = this.ctx;
+    const w = this.width;
+    const h = this.height;
+    const t = this.time;
+    if (!this.activeNpcId) return;
+
+    const def = DISTRIBUTORS[this.activeNpcId];
+    const dist = this.engine.distributors[this.activeNpcId];
+    const theme = NPC_THEMES[this.activeNpcId] || NPC_THEMES.grix;
+    if (!def || !dist) return;
+
+    // ── Background scene ──
+    const bgGrad = ctx.createLinearGradient(0, 0, 0, h);
+    bgGrad.addColorStop(0, theme.bgTop);
+    bgGrad.addColorStop(0.6, theme.bgBot);
+    bgGrad.addColorStop(1, '#050308');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, w, h);
+
+    // Zone-specific environment
+    this.drawNpcEnvironment(ctx, w, h, t, this.activeNpcId, theme);
+
+    // ── Ambient particles ──
+    for (const p of this.particles) {
+      const lifeR = p.life / p.maxLife;
+      const a = p.alpha * (lifeR < 0.1 ? lifeR / 0.1 : lifeR > 0.8 ? (1 - lifeR) / 0.2 : 1);
+      ctx.globalAlpha = a;
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, Math.max(0.5, p.size), 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.globalAlpha = 1;
+
+    // ── NPC glow ──
+    ctx.globalCompositeOperation = 'lighter';
+    const nGrad = ctx.createRadialGradient(this.npcX, this.npcY, 0, this.npcX, this.npcY, 120);
+    nGrad.addColorStop(0, `${theme.ambientColor}25`);
+    nGrad.addColorStop(1, 'transparent');
+    ctx.fillStyle = nGrad;
+    ctx.beginPath();
+    ctx.arc(this.npcX, this.npcY, 120, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+
+    // ── NPC character (big) ──
+    const bob = Math.sin(t * 2) * 4;
+    this.drawBigNpc(ctx, this.npcX, this.npcY + bob, this.activeNpcId, t);
+
+    // ── Name plate ──
+    ctx.fillStyle = '#e2ddf5';
+    ctx.font = '700 16px "Cinzel", serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(def.name, this.npcX, this.npcY + 65);
+    ctx.fillStyle = '#8b83a8';
+    ctx.font = '500 11px Inter, sans-serif';
+    ctx.fillText(def.location, this.npcX, this.npcY + 80);
+
+    // ── Stock display ──
+    const cap = this.engine.getDistributorCapacity(dist);
+    ctx.fillStyle = '#8b83a8';
+    ctx.font = '500 11px Inter, sans-serif';
+    ctx.fillText(`Stock: ${dist.stock.length}/${cap} · Cut: ${Math.round(def.cut * 100)}%`, this.npcX, this.npcY + 95);
+
+    // Stock dots
+    for (let i = 0; i < cap; i++) {
+      const dotX = this.npcX - (cap * 6) / 2 + i * 6 + 3;
+      ctx.fillStyle = i < dist.stock.length ? theme.ambientColor : '#2d2555';
+      ctx.beginPath();
+      ctx.arc(dotX, this.npcY + 104, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ── Collect gold button ──
+    if (dist.goldEarned > 0) {
+      const btnW = 160;
+      const btnH = 42;
+      const btnX = this.npcX - btnW / 2;
+      const btnY = this.npcY + 115;
+      const bGrad = ctx.createLinearGradient(btnX, btnY, btnX + btnW, btnY + btnH);
+      bGrad.addColorStop(0, '#b8860b');
+      bGrad.addColorStop(1, '#fbbf24');
+      ctx.fillStyle = bGrad;
+      this.roundRect(ctx, btnX, btnY, btnW, btnH, 10);
+      ctx.fill();
+      ctx.shadowColor = '#fbbf24';
+      ctx.shadowBlur = 12;
+      this.roundRect(ctx, btnX, btnY, btnW, btnH, 10);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#1a0a00';
+      ctx.font = '700 14px Inter, sans-serif';
+      ctx.fillText(`Collect ${dist.goldEarned}g`, this.npcX, btnY + 26);
+    }
+
+    ctx.textAlign = 'start';
+
+    // ── Speech bubble ──
+    if (this.speechText && t - this.speechTime < 3) {
+      const elapsed = t - this.speechTime;
+      const alpha = elapsed < 2.5 ? 1 : (3 - elapsed) / 0.5;
+      ctx.globalAlpha = alpha;
+      ctx.font = '500 13px Inter, sans-serif';
+      const tw = ctx.measureText(this.speechText).width + 24;
+      const th = 32;
+      const bx = this.npcX - tw / 2;
+      const by = this.npcY - 80;
+
+      ctx.fillStyle = 'rgba(255,255,255,0.95)';
+      this.roundRect(ctx, bx, by, tw, th, 10);
+      ctx.fill();
+      // Tail
+      ctx.beginPath();
+      ctx.moveTo(this.npcX - 6, by + th);
+      ctx.lineTo(this.npcX, by + th + 8);
+      ctx.lineTo(this.npcX + 6, by + th);
+      ctx.fill();
+
+      ctx.fillStyle = '#1a1a2e';
+      ctx.textAlign = 'center';
+      ctx.fillText(this.speechText, this.npcX, by + 20);
+      ctx.textAlign = 'start';
+      ctx.globalAlpha = 1;
     }
 
     // ── Flying potions ──
     for (const fp of this.flyingPotions) {
       if (fp.landed) continue;
       ctx.globalCompositeOperation = 'lighter';
-      const grad = ctx.createRadialGradient(fp.x, fp.y, 0, fp.x, fp.y, fp.size * 1.5);
+      const grad = ctx.createRadialGradient(fp.x, fp.y, 0, fp.x, fp.y, Math.max(1, fp.size * 1.5));
       grad.addColorStop(0, 'white');
       grad.addColorStop(0.4, fp.color);
       grad.addColorStop(1, 'transparent');
@@ -445,243 +695,323 @@ export class DistributorView {
 
     // ── Flying coins ──
     for (const c of this.flyingCoins) {
-      const alpha = Math.min(1, c.life / 15);
-      ctx.globalAlpha = alpha;
+      ctx.globalAlpha = Math.min(1, c.life / 15);
       ctx.fillStyle = '#fbbf24';
       ctx.beginPath();
       ctx.arc(c.x, c.y, Math.max(1, c.size), 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = '#b8860b';
+      ctx.fillStyle = '#fde68a';
       ctx.beginPath();
-      ctx.arc(c.x, c.y, Math.max(0.5, c.size * 0.6), 0, Math.PI * 2);
+      ctx.arc(c.x - 1, c.y - 1, Math.max(0.5, c.size * 0.4), 0, Math.PI * 2);
       ctx.fill();
     }
     ctx.globalAlpha = 1;
 
     // ── Dragged potion ──
     if (this.dragging) {
-      const dx = this.dragging.x;
-      const dy = this.dragging.y;
       const catColors: Record<string, string> = { potion: '#a855f7', candy: '#fb923c', prank: '#f87171', enchant: '#60a5fa' };
       const color = catColors[this.dragging.potion.category] || '#a855f7';
       ctx.globalCompositeOperation = 'lighter';
-      const dGrad = ctx.createRadialGradient(dx, dy, 0, dx, dy, 30);
+      const dGrad = ctx.createRadialGradient(this.dragging.x, this.dragging.y, 0, this.dragging.x, this.dragging.y, 30);
       dGrad.addColorStop(0, 'rgba(255,255,255,0.5)');
       dGrad.addColorStop(0.3, color);
       dGrad.addColorStop(1, 'transparent');
       ctx.fillStyle = dGrad;
       ctx.beginPath();
-      ctx.arc(dx, dy, 30, 0, Math.PI * 2);
+      ctx.arc(this.dragging.x, this.dragging.y, 30, 0, Math.PI * 2);
       ctx.fill();
       ctx.globalCompositeOperation = 'source-over';
 
-      // Highlight closest NPC
-      for (const npc of this.npcs) {
-        const dist = Math.hypot(dx - npc.x, dy - npc.y);
-        if (dist < 60) {
-          ctx.strokeStyle = '#4ade80';
-          ctx.lineWidth = 2;
-          ctx.setLineDash([5, 4]);
-          ctx.globalAlpha = 0.5 + Math.sin(t * 4) * 0.2;
-          ctx.beginPath();
-          ctx.arc(npc.x, npc.y, 45, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.globalAlpha = 1;
-          break;
-        }
+      // Drop zone
+      const dd = Math.hypot(this.dragging.x - this.npcX, this.dragging.y - this.npcY);
+      if (dd < 100) {
+        ctx.strokeStyle = '#4ade80';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        ctx.globalAlpha = 0.5 + Math.sin(t * 4) * 0.2;
+        ctx.beginPath();
+        ctx.arc(this.npcX, this.npcY, 55, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
       }
     }
 
     // ── Potion tray ──
     this.drawPotionTray(ctx, w, h);
 
-    // ── Close button ──
-    ctx.fillStyle = 'rgba(30, 24, 56, 0.8)';
+    // ── Back/Close button ──
+    this.drawCloseButton(ctx);
+  }
+
+  // ── NPC Environment Backgrounds ───────────
+
+  private drawNpcEnvironment(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, npcId: string, theme: NpcTheme): void {
+    const groundY = h * 0.55;
+
+    switch (npcId) {
+      case 'grix': // Market Square — stalls, lanterns
+        // Stall awning
+        ctx.fillStyle = '#2d4a1a';
+        ctx.fillRect(w * 0.1, h * 0.15, w * 0.8, h * 0.05);
+        ctx.fillStyle = '#3a5a24';
+        for (let i = 0; i < 6; i++) {
+          ctx.beginPath();
+          ctx.moveTo(w * 0.1 + i * (w * 0.8 / 6), h * 0.2);
+          ctx.lineTo(w * 0.1 + (i + 0.5) * (w * 0.8 / 6), h * 0.25);
+          ctx.lineTo(w * 0.1 + (i + 1) * (w * 0.8 / 6), h * 0.2);
+          ctx.fill();
+        }
+        // Crates
+        ctx.fillStyle = '#3d2815';
+        ctx.fillRect(w * 0.05, groundY - 25, 30, 25);
+        ctx.fillRect(w * 0.85, groundY - 20, 25, 20);
+        // Lantern glow
+        ctx.globalCompositeOperation = 'lighter';
+        for (const lx of [w * 0.2, w * 0.8]) {
+          const lg = ctx.createRadialGradient(lx, h * 0.12, 0, lx, h * 0.12, 60);
+          lg.addColorStop(0, 'rgba(251,191,36,0.1)');
+          lg.addColorStop(1, 'transparent');
+          ctx.fillStyle = lg;
+          ctx.beginPath();
+          ctx.arc(lx, h * 0.12, 60 + Math.sin(t * 4) * 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalCompositeOperation = 'source-over';
+        break;
+
+      case 'whisper': // Academy Gardens — flowers, trees, sparkles
+        // Trees
+        for (const tx of [w * 0.1, w * 0.85]) {
+          ctx.fillStyle = '#2a1a3a';
+          ctx.fillRect(tx - 4, groundY - 60, 8, 60);
+          ctx.fillStyle = '#3a2a4a';
+          ctx.beginPath();
+          ctx.arc(tx, groundY - 70, 25, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        // Flowers
+        for (let i = 0; i < 8; i++) {
+          const fx = w * 0.15 + (i / 8) * w * 0.7;
+          const fy = groundY - 5 + Math.sin(i * 2) * 3;
+          ctx.fillStyle = ['#f9a8d4', '#c4b5fd', '#fde68a', '#93c5fd'][i % 4];
+          ctx.globalAlpha = 0.5;
+          ctx.beginPath();
+          ctx.arc(fx, fy, 3, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        break;
+
+      case 'skrag': // Back Alleys — brick walls, shadows, dripping
+        // Brick walls
+        ctx.fillStyle = '#1a0e0e';
+        ctx.fillRect(0, 0, w * 0.15, groundY);
+        ctx.fillRect(w * 0.85, 0, w * 0.15, groundY);
+        ctx.strokeStyle = '#0d0808';
+        ctx.lineWidth = 0.5;
+        for (let row = 0; row < groundY / 12; row++) {
+          const off = (row % 2) * 10;
+          for (let col = 0; col < 4; col++) {
+            ctx.strokeRect(off + col * 20, row * 12, 18, 10);
+            ctx.strokeRect(w - 60 + off + col * 20, row * 12, 18, 10);
+          }
+        }
+        // Puddle reflection
+        ctx.globalAlpha = 0.08;
+        ctx.fillStyle = theme.ambientColor;
+        ctx.beginPath();
+        ctx.ellipse(w * 0.6, groundY + 20, 30, 6, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        break;
+
+      case 'barnaby': // Noble District — columns, chandelier
+        // Columns
+        for (const cx of [w * 0.12, w * 0.88]) {
+          ctx.fillStyle = '#2a2240';
+          ctx.fillRect(cx - 8, h * 0.05, 16, groundY - h * 0.05);
+          ctx.fillStyle = '#3a3250';
+          ctx.fillRect(cx - 12, h * 0.05, 24, 10);
+          ctx.fillRect(cx - 12, groundY - 10, 24, 10);
+        }
+        // Chandelier
+        ctx.strokeStyle = '#b8860b';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(w * 0.5, 0); ctx.lineTo(w * 0.5, 20); ctx.stroke();
+        ctx.strokeStyle = '#92400e';
+        ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(w * 0.35, 25); ctx.lineTo(w * 0.65, 25); ctx.stroke();
+        for (const dx of [-40, 0, 40]) {
+          const flicker = Math.sin(t * 6 + dx) * 0.2;
+          ctx.fillStyle = '#fbbf24';
+          ctx.globalAlpha = 0.6 + flicker;
+          ctx.beginPath();
+          ctx.arc(w * 0.5 + dx, 20, 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        break;
+
+      case 'patches': // The Docks — wooden planks, ropes, water
+        // Planks
+        ctx.fillStyle = '#1a1820';
+        for (let i = 0; i < 6; i++) {
+          ctx.fillRect(0, groundY + i * 12, w, 10);
+          ctx.strokeStyle = '#0f0e18';
+          ctx.lineWidth = 0.5;
+          ctx.strokeRect(0, groundY + i * 12, w, 10);
+        }
+        // Water shimmer at bottom
+        ctx.globalAlpha = 0.06;
+        ctx.fillStyle = theme.ambientColor;
+        for (let i = 0; i < 8; i++) {
+          const rx = (i * 60 + t * 15) % w;
+          ctx.fillRect(rx, groundY + 50 + Math.sin(t + i) * 3, 35, 2);
+        }
+        ctx.globalAlpha = 1;
+        // Rope
+        ctx.strokeStyle = '#3a3020';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(w * 0.05, h * 0.1);
+        ctx.quadraticCurveTo(w * 0.15, h * 0.2, w * 0.1, h * 0.3);
+        ctx.stroke();
+        break;
+    }
+
+    // Ground
+    ctx.fillStyle = theme.groundColor;
+    ctx.fillRect(0, groundY, w, h - groundY);
+  }
+
+  // ── Big NPC Character ─────────────────────
+
+  private drawBigNpc(ctx: CanvasRenderingContext2D, x: number, y: number, npcId: string, t: number): void {
+    const colors: Record<string, { body: string; face: string; eye: string }> = {
+      grix: { body: '#2d5a2d', face: '#4ade80', eye: '#fbbf24' },
+      whisper: { body: '#d946a8', face: '#fce7f3', eye: '#ec4899' },
+      skrag: { body: '#7f1d1d', face: '#dc2626', eye: '#fbbf24' },
+      barnaby: { body: '#78350f', face: '#fde68a', eye: '#1a1a2e' },
+      patches: { body: '#c2410c', face: '#fb923c', eye: '#fef3c7' },
+    };
+    const c = colors[npcId] || colors.grix;
+    const r = 38; // head radius
+
+    // Body
+    ctx.fillStyle = c.body;
     ctx.beginPath();
-    ctx.arc(this.closeBtnX, this.closeBtnY, this.closeBtnR, 0, Math.PI * 2);
+    ctx.ellipse(x, y + r + 15, r * 0.8, 20, 0, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = '#8b83a8';
-    ctx.lineWidth = 2;
-    const cs = 7;
+
+    // Head
+    ctx.fillStyle = c.body;
     ctx.beginPath();
-    ctx.moveTo(this.closeBtnX - cs, this.closeBtnY - cs);
-    ctx.lineTo(this.closeBtnX + cs, this.closeBtnY + cs);
-    ctx.moveTo(this.closeBtnX + cs, this.closeBtnY - cs);
-    ctx.lineTo(this.closeBtnX - cs, this.closeBtnY + cs);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fill();
+    // Face
+    ctx.fillStyle = c.face;
+    ctx.beginPath();
+    ctx.arc(x, y - 2, r * 0.85, 0, Math.PI * 2);
+    ctx.fill();
+
+    // NPC-specific features
+    if (npcId === 'grix') {
+      // Pointy ears
+      ctx.fillStyle = c.face;
+      ctx.beginPath(); ctx.moveTo(x - r, y - 5); ctx.lineTo(x - r - 14, y - 18); ctx.lineTo(x - r + 8, y - 12); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + r, y - 5); ctx.lineTo(x + r + 14, y - 18); ctx.lineTo(x + r - 8, y - 12); ctx.fill();
+    } else if (npcId === 'whisper') {
+      // Wings
+      ctx.fillStyle = '#f9a8d4';
+      ctx.globalAlpha = 0.4;
+      const wingFlap = Math.sin(t * 4) * 5;
+      ctx.beginPath(); ctx.ellipse(x - r - 10, y - 10, 18, 28 + wingFlap, -0.3, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(x + r + 10, y - 10, 18, 28 + wingFlap, 0.3, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    } else if (npcId === 'skrag') {
+      // Horns
+      ctx.fillStyle = '#4a0e0e';
+      ctx.beginPath(); ctx.moveTo(x - 15, y - r + 5); ctx.lineTo(x - 20, y - r - 18); ctx.lineTo(x - 8, y - r + 2); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 15, y - r + 5); ctx.lineTo(x + 20, y - r - 18); ctx.lineTo(x + 8, y - r + 2); ctx.fill();
+    } else if (npcId === 'barnaby') {
+      // Hat
+      ctx.fillStyle = '#4a3020';
+      ctx.fillRect(x - 25, y - r - 5, 50, 8);
+      ctx.fillRect(x - 18, y - r - 22, 36, 20);
+    } else if (npcId === 'patches') {
+      // Ears
+      ctx.fillStyle = c.face;
+      ctx.beginPath(); ctx.moveTo(x - 18, y - r + 8); ctx.lineTo(x - 12, y - r - 16); ctx.lineTo(x - 4, y - r + 5); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 18, y - r + 8); ctx.lineTo(x + 12, y - r - 16); ctx.lineTo(x + 4, y - r + 5); ctx.fill();
+      // Inner ear
+      ctx.fillStyle = '#fce7f3';
+      ctx.beginPath(); ctx.moveTo(x - 15, y - r + 6); ctx.lineTo(x - 12, y - r - 10); ctx.lineTo(x - 7, y - r + 4); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(x + 15, y - r + 6); ctx.lineTo(x + 12, y - r - 10); ctx.lineTo(x + 7, y - r + 4); ctx.fill();
+    }
+
+    // Eyes
+    const eyeSpread = 11;
+    ctx.fillStyle = 'white';
+    ctx.beginPath(); ctx.ellipse(x - eyeSpread, y - 6, 8, 10, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(x + eyeSpread, y - 6, 8, 10, 0, 0, Math.PI * 2); ctx.fill();
+    // Pupils (look toward mouse/potion)
+    let lookX = 0;
+    if (this.dragging) lookX = Math.sign(this.dragging.x - x) * 2;
+    ctx.fillStyle = c.eye;
+    ctx.beginPath(); ctx.arc(x - eyeSpread + lookX, y - 5, 5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + eyeSpread + lookX, y - 5, 5, 0, Math.PI * 2); ctx.fill();
+    // Shine
+    ctx.fillStyle = 'white';
+    ctx.beginPath(); ctx.arc(x - eyeSpread - 1 + lookX, y - 8, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + eyeSpread - 1 + lookX, y - 8, 2.5, 0, Math.PI * 2); ctx.fill();
+
+    // Mouth
+    ctx.strokeStyle = this.darken(c.face, 60);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x, y + 10, 8, 0.1, Math.PI - 0.1);
     ctx.stroke();
   }
 
-  // ── NPC Drawing ───────────────────────────
+  private drawMiniNpc(ctx: CanvasRenderingContext2D, x: number, y: number, npcId: string, r: number, t: number): void {
+    const colors: Record<string, { face: string; eye: string }> = {
+      grix: { face: '#4ade80', eye: '#fbbf24' },
+      whisper: { face: '#fce7f3', eye: '#ec4899' },
+      skrag: { face: '#dc2626', eye: '#fbbf24' },
+      barnaby: { face: '#fde68a', eye: '#1a1a2e' },
+      patches: { face: '#fb923c', eye: '#fef3c7' },
+    };
+    const c = colors[npcId] || colors.grix;
 
-  private drawNpc(ctx: CanvasRenderingContext2D, npc: NpcVisual, dist: DistributorState, t: number): void {
-    const x = npc.x;
-    const bob = Math.sin(t * 2 + npc.bobPhase) * 3;
-    const y = npc.y + bob;
-    const selected = this.selectedNpc === npc.id;
-    const locked = !dist.unlocked;
-    const cap = this.engine.getDistributorCapacity(dist);
-
-    // Selection glow
-    if (selected) {
-      ctx.globalCompositeOperation = 'lighter';
-      const selGrad = ctx.createRadialGradient(x, y, 0, x, y, 55);
-      selGrad.addColorStop(0, `rgba(${this.hexToRgb(npc.color)},0.15)`);
-      selGrad.addColorStop(1, 'transparent');
-      ctx.fillStyle = selGrad;
-      ctx.beginPath();
-      ctx.arc(x, y, 55, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalCompositeOperation = 'source-over';
-    }
-
-    ctx.globalAlpha = locked ? 0.4 : 1;
-
-    // Body (simple round character)
-    ctx.fillStyle = npc.bodyColor;
+    ctx.fillStyle = c.face;
     ctx.beginPath();
-    ctx.arc(x, y, 22, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Face highlight
-    ctx.fillStyle = this.lighten(npc.bodyColor, 30);
-    ctx.beginPath();
-    ctx.arc(x, y - 4, 18, 0, Math.PI * 2);
+    ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fill();
 
     // Eyes
+    ctx.fillStyle = c.eye;
+    ctx.beginPath(); ctx.arc(x - 5, y - 3, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 5, y - 3, 3, 0, Math.PI * 2); ctx.fill();
     ctx.fillStyle = 'white';
-    ctx.beginPath();
-    ctx.ellipse(x - 6, y - 5, 5, 6, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.ellipse(x + 6, y - 5, 5, 6, 0, 0, Math.PI * 2);
-    ctx.fill();
-    // Pupils
-    ctx.fillStyle = npc.eyeColor;
-    ctx.beginPath();
-    ctx.arc(x - 5, y - 4, 3, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x + 7, y - 4, 3, 0, Math.PI * 2);
-    ctx.fill();
-    // Eye shine
-    ctx.fillStyle = 'white';
-    ctx.beginPath();
-    ctx.arc(x - 6, y - 6, 1.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.beginPath();
-    ctx.arc(x + 6, y - 6, 1.5, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Mouth
-    ctx.strokeStyle = this.darken(npc.bodyColor, 40);
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.arc(x, y + 4, 5, 0.1, Math.PI - 0.1);
-    ctx.stroke();
-
-    ctx.globalAlpha = 1;
-
-    // Name
-    ctx.fillStyle = locked ? '#4a3d6a' : '#e2ddf5';
-    ctx.font = '600 11px Inter, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(npc.name, x, y + 38);
-
-    if (locked) {
-      // Lock + price
-      ctx.fillStyle = '#fbbf24';
-      ctx.font = '600 10px Inter, sans-serif';
-      ctx.fillText(`Unlock ${dist.def.unlockCost}g`, x, y + 50);
-    } else {
-      // Stock info
-      ctx.fillStyle = '#8b83a8';
-      ctx.font = '500 10px Inter, sans-serif';
-      ctx.fillText(`${dist.stock.length}/${cap}`, x, y + 50);
-
-      // Stock dots
-      for (let i = 0; i < cap; i++) {
-        const dotX = x - (cap * 5) / 2 + i * 5 + 2.5;
-        ctx.fillStyle = i < dist.stock.length ? npc.color : '#2d2555';
-        ctx.beginPath();
-        ctx.arc(dotX, y + 57, 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-
-      // Gold earned indicator
-      if (dist.goldEarned > 0 && selected) {
-        const btnW = 120;
-        const btnH = 34;
-        const btnX = x - btnW / 2;
-        const btnY = y + 65;
-        const btnGrad = ctx.createLinearGradient(btnX, btnY, btnX + btnW, btnY + btnH);
-        btnGrad.addColorStop(0, '#b8860b');
-        btnGrad.addColorStop(1, '#fbbf24');
-        ctx.fillStyle = btnGrad;
-        this.roundRect(ctx, btnX, btnY, btnW, btnH, 8);
-        ctx.fill();
-        ctx.fillStyle = '#1a0a00';
-        ctx.font = '600 12px Inter, sans-serif';
-        ctx.fillText(`Collect ${dist.goldEarned}g`, x, btnY + 21);
-        this.collectBtnNpc = npc.id;
-      } else if (dist.goldEarned > 0) {
-        // Pulsing gold indicator
-        ctx.globalAlpha = 0.5 + Math.sin(t * 3) * 0.3;
-        ctx.fillStyle = '#fbbf24';
-        ctx.beginPath();
-        ctx.arc(x + 18, y - 18, 6, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#b8860b';
-        ctx.font = '700 7px Inter, sans-serif';
-        ctx.fillText('$', x + 18, y - 16);
-        ctx.globalAlpha = 1;
-      }
-    }
-
-    // Speech bubble
-    if (npc.speech && t - npc.speechTime < 2) {
-      const bubbleAlpha = t - npc.speechTime < 1.5 ? 1 : (2 - (t - npc.speechTime)) / 0.5;
-      ctx.globalAlpha = bubbleAlpha;
-      const bw = ctx.measureText(npc.speech).width + 16;
-      const bh = 26;
-      const bx = x - bw / 2;
-      const by = y - 48;
-      ctx.fillStyle = 'rgba(255,255,255,0.95)';
-      this.roundRect(ctx, bx, by, bw, bh, 8);
-      ctx.fill();
-      // Tail
-      ctx.beginPath();
-      ctx.moveTo(x - 5, by + bh);
-      ctx.lineTo(x, by + bh + 6);
-      ctx.lineTo(x + 5, by + bh);
-      ctx.fill();
-      ctx.fillStyle = '#1a1a2e';
-      ctx.font = '600 11px Inter, sans-serif';
-      ctx.fillText(npc.speech, x, by + 17);
-      ctx.globalAlpha = 1;
-    }
-
-    ctx.textAlign = 'start';
+    ctx.beginPath(); ctx.arc(x - 5.5, y - 4.5, 1.2, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(x + 4.5, y - 4.5, 1.2, 0, Math.PI * 2); ctx.fill();
   }
 
   // ── Potion Tray ───────────────────────────
 
   private drawPotionTray(ctx: CanvasRenderingContext2D, w: number, h: number): void {
     const trayY = h - 106;
-    ctx.fillStyle = 'rgba(10, 8, 24, 0.7)';
+    ctx.fillStyle = 'rgba(10, 8, 24, 0.75)';
     ctx.fillRect(0, trayY, w, 106);
     ctx.strokeStyle = '#2d2555';
     ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(0, trayY);
-    ctx.lineTo(w, trayY);
-    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, trayY); ctx.lineTo(w, trayY); ctx.stroke();
 
     ctx.fillStyle = '#8b83a8';
     ctx.font = '500 11px Inter, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillText('Drag potions to a distributor', w / 2, trayY + 14);
+    ctx.fillText('Drag potions to give them', w / 2, trayY + 14);
     ctx.textAlign = 'start';
 
     if (this.potionSlots.length === 0) {
@@ -703,7 +1033,6 @@ export class DistributorView {
       ctx.fill();
       ctx.stroke();
 
-      // Potion orb
       const color = catColors[slot.potion.category] || '#a855f7';
       ctx.fillStyle = color;
       ctx.beginPath();
@@ -716,39 +1045,37 @@ export class DistributorView {
       ctx.fill();
       ctx.globalAlpha = 1;
 
-      // Name
       ctx.fillStyle = '#e2ddf5';
       ctx.font = '500 9px Inter, sans-serif';
       ctx.textAlign = 'center';
       const name = slot.potion.name.length > 9 ? slot.potion.name.slice(0, 8) + '.' : slot.potion.name;
       ctx.fillText(name, slot.x + slot.w / 2, slot.y + 50);
-
-      // Quality + price
       ctx.fillStyle = '#8b83a8';
       ctx.font = '500 9px Inter, sans-serif';
-      ctx.fillText(`${slot.potion.quality.slice(0, 3)} · ${slot.potion.sellPrice}g`, slot.x + slot.w / 2, slot.y + 64);
-
+      ctx.fillText(`${slot.potion.sellPrice}g`, slot.x + slot.w / 2, slot.y + 64);
       ctx.textAlign = 'start';
     }
   }
 
+  // ── UI Elements ───────────────────────────
+
+  private drawCloseButton(ctx: CanvasRenderingContext2D): void {
+    ctx.fillStyle = 'rgba(30, 24, 56, 0.8)';
+    ctx.beginPath();
+    ctx.arc(this.closeBtnX, this.closeBtnY, this.closeBtnR, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#8b83a8';
+    ctx.lineWidth = 2;
+    const cs = 7;
+    ctx.beginPath();
+    ctx.moveTo(this.closeBtnX - cs, this.closeBtnY - cs);
+    ctx.lineTo(this.closeBtnX + cs, this.closeBtnY + cs);
+    ctx.moveTo(this.closeBtnX + cs, this.closeBtnY - cs);
+    ctx.lineTo(this.closeBtnX - cs, this.closeBtnY + cs);
+    ctx.stroke();
+  }
+
   // ── Helpers ───────────────────────────────
-
-  private hexToRgb(hex: string): string {
-    if (hex.startsWith('#') && hex.length >= 7) {
-      const v = parseInt(hex.slice(1, 7), 16);
-      return `${(v >> 16) & 255},${(v >> 8) & 255},${v & 255}`;
-    }
-    return '168,85,247';
-  }
-
-  private lighten(hex: string, amount: number): string {
-    const v = parseInt(hex.slice(1), 16);
-    const r = Math.min(255, ((v >> 16) & 255) + amount);
-    const g = Math.min(255, ((v >> 8) & 255) + amount);
-    const b = Math.min(255, (v & 255) + amount);
-    return `rgb(${r},${g},${b})`;
-  }
 
   private darken(hex: string, amount: number): string {
     const v = parseInt(hex.slice(1), 16);
