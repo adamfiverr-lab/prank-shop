@@ -291,12 +291,12 @@ export class DistributorView {
     const dist = this.engine.distributors[this.activeNpcId];
     if (!dist) return;
 
-    // Collect gold button
+    // Collect gold button — must match draw position (npcY + 115)
     if (dist.goldEarned > 0) {
-      const btnW = 150;
-      const btnH = 40;
+      const btnW = 160;
+      const btnH = 42;
       const btnX = this.npcX - btnW / 2;
-      const btnY = this.npcY + 90;
+      const btnY = this.npcY + 115;
       if (x >= btnX && x <= btnX + btnW && y >= btnY && y <= btnY + btnH) {
         const amount = this.engine.collectDistributorGold(this.activeNpcId);
         if (amount > 0) {
